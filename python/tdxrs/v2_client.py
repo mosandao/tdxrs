@@ -292,7 +292,7 @@ def _decode_quote(payload: bytes, code: str) -> dict:
         if last_close is None:
             raise
         raise TdxV2NoQuote(
-            f"停牌/无成交快照（昨收 {last_close}，开高低现/量/额全 0）"
+            f"停牌/无成交快照（昨收 {last_close}，开高低/量/额全 0）"
         ) from None
     vol_lots = struct.unpack("<I", payload[anchor + 20 : anchor + 24])[0]
     amount = struct.unpack("<f", payload[anchor + 28 : anchor + 32])[0]
@@ -331,19 +331,23 @@ def _find_price_block(payload: bytes) -> int:
 
 
 def _find_no_quote_block(payload: bytes) -> float | None:
-    """识别停牌/无成交退化快照：[昨收>0][开/高/低/现 4 个 0.0][量 u32=0][额 f32=0]。
+    """识别停牌/无成交退化快照：五连价 [昨收][0][0][0][现] 中开/高/低必为
+    精确 0，昨收>0，现价为 0 或等于昨收（无成交参考价），且量/额全 0。
 
     仅在正常价格块锚定失败后调用。自名称区前界（帧尾固定 120B 为 GBK
-    名称，见 decode_gbk_name）向回扫：五连精确 0 加正昨收在正常行情里
-    不存在，而前置字段区/名称区的字节伪影（如"*ST康佳A"的 GBK 串被
-    误读为正 float）都在真块之前，倒序首个命中即真昨收。
+    名称，见 decode_gbk_name）向回扫：前置字段区/名称区的字节伪影
+    （如 *ST康佳A 的 GBK 串恰被误读为正 float 26.2）都在真块之前，
+    倒序首个命中即真昨收。实证形态（2026-09-14）：*ST康佳A 昨收 2.46
+    现价 0；600301 昨收=现价 45.43，开高低 0，量额均 0。
     """
     for pos in range(len(payload) - 136, 32, -1):
-        (last_close,) = struct.unpack("<f", payload[pos : pos + 4])
+        vals = struct.unpack("<5f", payload[pos : pos + 20])
+        last_close, o, h, low, price = vals
         if not 0.01 < last_close <= 1e6:
             continue
-        zeros = struct.unpack("<4f", payload[pos + 4 : pos + 20])
-        if any(v != 0.0 for v in zeros):
+        if o != 0.0 or h != 0.0 or low != 0.0:
+            continue
+        if price != 0.0 and price != last_close:
             continue
         (vol_lots,) = struct.unpack("<I", payload[pos + 20 : pos + 24])
         (amount,) = struct.unpack("<f", payload[pos + 28 : pos + 32])
