@@ -193,6 +193,16 @@ class TdxV2Client:
         return tail.split(b"\x00")[0].decode("gbk", errors="replace")
 
 
+def decode_bars(payload: bytes, code: str) -> list[Bar]:
+    """公共入口：解析日K载荷（与 TdxV2Client._decode_bars 同一实现）。"""
+    return TdxV2Client._decode_bars(payload, code)
+
+
+def decode_quote(payload: bytes, code: str) -> dict:
+    """公共入口：解析实时快照载荷（与 get_quote 同一实现）。"""
+    return _decode_quote(payload, code)
+
+
 def _decode_quote(payload: bytes, code: str) -> dict:
     """解析实时快照。价格块靠 OHLC 关系锚定（帧内含请求回显与变长名称区，
     无固定偏移）；返回字段：last_close/open/high/low/price、vol(股)、amount(元)。"""
