@@ -112,6 +112,14 @@ class TdxV2Error(Exception):
     pass
 
 
+class TdxV2NoQuote(TdxV2Error):
+    """停牌/无成交的退化快照：昨收有值，开/高/低/现/量/额全 0。
+
+    是服务端对停牌股的合法应答而非格式变更；调用方应跳过该票，
+    而不是当作通道故障整批回退。
+    """
+
+
 class TdxV2Client:
     """新一代 7709 协议客户端。线程不安全，一连接一用，连接内可连续多请求。"""
 
@@ -269,10 +277,23 @@ def decode_minute(payload: bytes) -> list[MinutePoint]:
 
 def _decode_quote(payload: bytes, code: str) -> dict:
     """解析实时快照。价格块靠 OHLC 关系锚定（帧内含请求回显与变长名称区，
-    无固定偏移）；返回字段：last_close/open/high/low/price、vol(股)、amount(元)。"""
+    无固定偏移）；返回字段：last_close/open/high/low/price、vol(股)、amount(元)。
+    停牌股的退化快照（昨收>0、开高低现/量/额全 0）与无数据短帧
+    （如 605081 退市清除后的 26B 应答）抛 TdxV2NoQuote。"""
+    if len(payload) < 34:
+        # 有效应答至少要放下代码回显（@28..34）；更短即服务端无此代码数据
+        raise TdxV2NoQuote(f"服务端短帧无数据（{len(payload)}B）")
     if payload[28:34] != code.encode():
         raise TdxV2Error(f"快照响应代码回显不匹配: {payload[28:34]!r} != {code}")
-    anchor = _find_price_block(payload)
+    try:
+        anchor = _find_price_block(payload)
+    except TdxV2Error:
+        last_close = _find_no_quote_block(payload)
+        if last_close is None:
+            raise
+        raise TdxV2NoQuote(
+            f"停牌/无成交快照（昨收 {last_close}，开高低现/量/额全 0）"
+        ) from None
     vol_lots = struct.unpack("<I", payload[anchor + 20 : anchor + 24])[0]
     amount = struct.unpack("<f", payload[anchor + 28 : anchor + 32])[0]
     return {
@@ -307,3 +328,25 @@ def _find_price_block(payload: bytes) -> int:
                     continue
             return pos
     raise TdxV2Error("快照载荷未找到价格块（休市或格式变更）")
+
+
+def _find_no_quote_block(payload: bytes) -> float | None:
+    """识别停牌/无成交退化快照：[昨收>0][开/高/低/现 4 个 0.0][量 u32=0][额 f32=0]。
+
+    仅在正常价格块锚定失败后调用。自名称区前界（帧尾固定 120B 为 GBK
+    名称，见 decode_gbk_name）向回扫：五连精确 0 加正昨收在正常行情里
+    不存在，而前置字段区/名称区的字节伪影（如"*ST康佳A"的 GBK 串被
+    误读为正 float）都在真块之前，倒序首个命中即真昨收。
+    """
+    for pos in range(len(payload) - 136, 32, -1):
+        (last_close,) = struct.unpack("<f", payload[pos : pos + 4])
+        if not 0.01 < last_close <= 1e6:
+            continue
+        zeros = struct.unpack("<4f", payload[pos + 4 : pos + 20])
+        if any(v != 0.0 for v in zeros):
+            continue
+        (vol_lots,) = struct.unpack("<I", payload[pos + 20 : pos + 24])
+        (amount,) = struct.unpack("<f", payload[pos + 28 : pos + 32])
+        if vol_lots == 0 and amount == 0.0:
+            return float(last_close)
+    return None
