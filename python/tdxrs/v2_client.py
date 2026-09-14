@@ -8,10 +8,15 @@
   字节串（80B），可跨连接重放；
 - 响应帧：[4B 魔数 b1 cb 74 00][u16 方法回显][8B][u16 载荷长][u16 载荷长回显]，
   载荷长位于 offset 12（LE u16），总长 = 16 + 载荷长；
-- 日K记录 36B：[u32 日期 YYYYMMDD][f32 保留][f32 开][f32 高][f32 低][f32 收]
-  [f32 成交额(元)][u32 成交量(股)][f32 流通股本(万股)]；载荷尾部 120B 为 GBK 名称区；
+- 日K记录 36B：[u32 日期 YYYYMMDD][u32 时间][f32 开][f32 高][f32 低][f32 收]
+  [f32 成交额(元)][f32 成交量(股)][f32 流通股本(万股)]；载荷尾部 120B 为 GBK 名称区。
+  时间字段：日线为 0；分钟/小时线为距午夜的秒数（如 37500=10:25:00，为 K 线结束时刻）；
 - 实时快照含五连价格块 [昨收][开][高][低][现价]（其后 +20 为成交量手数 u32、
   +28 为成交额 f32 元），块起点靠 OHLC 关系 + 量额互洽锚定（见 _find_price_block）；
+- 分时记录 18B（记录区自载荷 offset 37 起）：[f32 价格][f32 均价][u32 成交量]
+  [u32 保留][u16 距午夜分钟数]（571=09:31）；尾部为少量摘要字段；
+- bars 请求帧：市场@12、代码@14、周期 u16@36（枚举与老协议一致）、
+  起始偏移 u32@40（0=最新窗口向前）、条数 u16@44（服务端单次上限 700）；
 - 市场字节：1=沪 0=深（与老协议一致）。
 
 请求帧模板取自官方客户端抓包原文（见 research/），代码字段以哨兵
@@ -31,8 +36,19 @@ CODE_SENTINEL = b"C0DE00"
 MARKET_SH = 1
 MARKET_SZ = 0
 
-# 周期类别：日线=4（与老协议 KLINE_DAILY 同源）；其余周期字段位待逐一验证
+# 周期类别（2026-09-13 全枚举实测：与老协议 KLINE_* 同源同值）
+KLINE_5MIN = 0
+KLINE_15MIN = 1
+KLINE_30MIN = 2
+KLINE_1HOUR = 3
 KLINE_DAY = 4
+KLINE_WEEK = 5
+KLINE_MONTH = 6
+KLINE_3MONTH = 10
+KLINE_YEAR = 11
+
+# 服务端单次响应上限（payload u16 长度字段约束，实测 count>700 仍只回 700 条）
+MAX_BARS_PER_REQUEST = 700
 
 _DEFAULT_HOST = "121.36.248.138"
 
@@ -77,6 +93,19 @@ class Bar:
     amount: float
     vol: float
     float_share: float
+    time_sec: int = 0  # 盘中K线结束时刻（距午夜秒数）；日线为 0
+
+
+@dataclass
+class MinutePoint:
+    minute: int        # 距午夜分钟数（571=09:31）
+    price: float       # 分钟末价
+    avg_price: float   # 当日累计均价
+    vol: float         # 分钟成交量（股）
+
+    @property
+    def time(self) -> str:
+        return f"{self.minute // 60:02d}:{self.minute % 60:02d}"
 
 
 class TdxV2Error(Exception):
@@ -139,12 +168,16 @@ class TdxV2Client:
 
     # ── 业务接口 ──
     def get_bars(
-        self, market: int, code: str, count: int = 700, category: int = KLINE_DAY
+        self, market: int, code: str, count: int = 700, category: int = KLINE_DAY,
+        start: int = 0,
     ) -> list[Bar]:
-        """日K（其余周期的类别字段位未映射，暂只保证日线）。"""
+        """K 线。start=0 取最新 count 条，>0 向历史方向前移（u32@40 偏移字段，
+        实测与最新窗口无缝衔接）。count 服务端上限 700。周期枚举见模块常量
+        （5min/15min/30min/1h/日/周/月/季/年全可用）。"""
         f = bytearray(_BARS)
         f[_BARS_CATEGORY_OFF : _BARS_CATEGORY_OFF + 2] = struct.pack("<H", category)
         f[_BARS_COUNT_OFF : _BARS_COUNT_OFF + 2] = struct.pack("<H", count)
+        f[40:44] = struct.pack("<I", start)
         self._send(_put_code(bytes(f), _BARS_CODE_OFF, market, code))
         return self._decode_bars(self._recv_payload(), code)
 
@@ -159,9 +192,10 @@ class TdxV2Client:
         end = len(payload) - 120
         while pos + 36 <= end:
             rec = payload[pos : pos + 36]
-            date, _z, o, h, l, c, amount, vol = struct.unpack("<I7f", rec[:32])
+            (date, tm) = struct.unpack("<II", rec[:8])
+            o, h, l, c, amount, vol = struct.unpack("<6f", rec[8:32])
             (share,) = struct.unpack("<f", rec[32:36])
-            bars.append(Bar(int(date), o, h, l, c, amount, float(vol), share))
+            bars.append(Bar(int(date), o, h, l, c, amount, float(vol), share, int(tm)))
             pos += 36
         return bars
 
@@ -176,10 +210,15 @@ class TdxV2Client:
         self._send(_put_code(_QUOTE, _QUOTE_CODE_OFF, market, code))
         return self._recv_payload()
 
-    def get_minute_time_data(self, market: int, code: str) -> bytes:
-        """当日分时原始载荷（需先登录）。"""
+    def get_minute_time_data_raw(self, market: int, code: str) -> bytes:
+        """当日分时原始载荷（供字段研究）。"""
         self._send(_put_code(_MINUTE, _MINUTE_CODE_OFF, market, code))
         return self._recv_payload()
+
+    def get_minute_time_data(self, market: int, code: str) -> list[MinutePoint]:
+        """当日分时（已解码），按时间升序。"""
+        self._send(_put_code(_MINUTE, _MINUTE_CODE_OFF, market, code))
+        return decode_minute(self._recv_payload())
 
     def get_market_snapshot(self) -> bytes:
         """市场快照原始载荷（00 0d）。"""
@@ -201,6 +240,31 @@ def decode_bars(payload: bytes, code: str) -> list[Bar]:
 def decode_quote(payload: bytes, code: str) -> dict:
     """公共入口：解析实时快照载荷（与 get_quote 同一实现）。"""
     return _decode_quote(payload, code)
+
+
+# 分时记录 18B；记录区自载荷 offset 37 起（前 37B 为市场/代码回显 + 实时摘要，
+# 尾部为摘要字段，均按时间字段合法性自动截停）
+_MINUTE_REC_OFF = 37
+_MINUTE_REC_SIZE = 18
+
+
+def decode_minute(payload: bytes) -> list[MinutePoint]:
+    """解析当日分时载荷：[f32 价格][f32 均价][u32 成交量(股)][u32 保留]
+    [u16 距午夜分钟数]。以时间字段必须落在 A 股交易时刻表内截停记录流。"""
+    points: list[MinutePoint] = []
+    pos = _MINUTE_REC_OFF
+    n = len(payload)
+    while pos + _MINUTE_REC_SIZE <= n:
+        price, avg = struct.unpack("<2f", payload[pos : pos + 8])
+        vol, _rsv = struct.unpack("<2I", payload[pos + 8 : pos + 16])
+        (minute,) = struct.unpack("<H", payload[pos + 16 : pos + 18])
+        if not (570 <= minute <= 960) or not (0.0 < price <= 1e6):
+            break
+        points.append(MinutePoint(int(minute), float(price), float(avg), float(vol)))
+        pos += _MINUTE_REC_SIZE
+    if not points:
+        raise TdxV2Error("分时载荷未解析出记录（休市或格式变更）")
+    return points
 
 
 def _decode_quote(payload: bytes, code: str) -> dict:
