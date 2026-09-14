@@ -10,6 +10,8 @@
   载荷长位于 offset 12（LE u16），总长 = 16 + 载荷长；
 - 日K记录 36B：[u32 日期 YYYYMMDD][f32 保留][f32 开][f32 高][f32 低][f32 收]
   [f32 成交额(元)][u32 成交量(股)][f32 流通股本(万股)]；载荷尾部 120B 为 GBK 名称区；
+- 实时快照含五连价格块 [昨收][开][高][低][现价]（其后 +20 为成交量手数 u32、
+  +28 为成交额 f32 元），块起点靠 OHLC 关系 + 量额互洽锚定（见 _find_price_block）；
 - 市场字节：1=沪 0=深（与老协议一致）。
 
 请求帧模板取自官方客户端抓包原文（见 research/），代码字段以哨兵
@@ -163,8 +165,14 @@ class TdxV2Client:
             pos += 36
         return bars
 
-    def get_quote(self, market: int, code: str) -> bytes:
-        """实时快照原始载荷（字段映射随行情时段校准，盘前多为零填充）。"""
+    def get_quote(self, market: int, code: str) -> dict:
+        """实时快照，返回解析后的字段 dict：
+        last_close / open / high / low / price / vol(股) / amount(元)。"""
+        self._send(_put_code(_QUOTE, _QUOTE_CODE_OFF, market, code))
+        return _decode_quote(self._recv_payload(), code)
+
+    def get_quote_raw(self, market: int, code: str) -> bytes:
+        """实时快照原始载荷（供字段研究）。"""
         self._send(_put_code(_QUOTE, _QUOTE_CODE_OFF, market, code))
         return self._recv_payload()
 
@@ -183,3 +191,45 @@ class TdxV2Client:
         """从日K载荷尾部 120B 提取 GBK 证券名称。"""
         tail = bars_payload[-120:-88]
         return tail.split(b"\x00")[0].decode("gbk", errors="replace")
+
+
+def _decode_quote(payload: bytes, code: str) -> dict:
+    """解析实时快照。价格块靠 OHLC 关系锚定（帧内含请求回显与变长名称区，
+    无固定偏移）；返回字段：last_close/open/high/low/price、vol(股)、amount(元)。"""
+    if payload[28:34] != code.encode():
+        raise TdxV2Error(f"快照响应代码回显不匹配: {payload[28:34]!r} != {code}")
+    anchor = _find_price_block(payload)
+    vol_lots = struct.unpack("<I", payload[anchor + 20 : anchor + 24])[0]
+    amount = struct.unpack("<f", payload[anchor + 28 : anchor + 32])[0]
+    return {
+        "last_close": struct.unpack("<f", payload[anchor : anchor + 4])[0],
+        "open": struct.unpack("<f", payload[anchor + 4 : anchor + 8])[0],
+        "high": struct.unpack("<f", payload[anchor + 8 : anchor + 12])[0],
+        "low": struct.unpack("<f", payload[anchor + 12 : anchor + 16])[0],
+        "price": struct.unpack("<f", payload[anchor + 16 : anchor + 20])[0],
+        "vol": float(vol_lots) * 100.0,  # 手 → 股
+        "amount": float(amount),
+    }
+
+
+def _find_price_block(payload: bytes) -> int:
+    """在载荷中定位 [昨收][开][高][低][现价] 五连 float 块的起点。
+
+    除 OHLC 关系外加两条硬判据：价格须在 [0.01, 1e6]（排除请求回显区/
+    GBK 名称字节被误读为次正规浮点）；量额互洽——成交额/成交量换算的
+    均价必须落在 [low, high] 内（排除偶发的正浮点组合）。
+    """
+    for pos in range(32, len(payload) - 36):
+        vals = struct.unpack("<5f", payload[pos : pos + 20])
+        prev_close, o, h, l, price = vals
+        if not all(0.01 <= v <= 1e6 for v in vals):
+            continue
+        if h >= max(o, l, price) and l <= min(o, price) and h >= l:
+            vol_lots = struct.unpack("<I", payload[pos + 20 : pos + 24])[0]
+            amount = struct.unpack("<f", payload[pos + 28 : pos + 32])[0]
+            if vol_lots > 0 and amount > 0:
+                avg = amount / (vol_lots * 100.0)
+                if not (l * 0.98 <= avg <= h * 1.02):
+                    continue
+            return pos
+    raise TdxV2Error("快照载荷未找到价格块（休市或格式变更）")
