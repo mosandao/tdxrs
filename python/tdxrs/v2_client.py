@@ -65,6 +65,10 @@ _QUOTE = bytes.fromhex(
 _SNAPSHOT = bytes.fromhex(
     "000d002c12012d002d002c12060000000000000000000000000e00360000001b" + "000100fffce1cc3f080302000000000000000000000001"
 )  # 55B
+# 榜单报价轮询帧：同 _SNAPSHOT 骨架，@25=u16 榜单 id、@27=u16 记录偏移、@31=页大小
+_RANK_POLL = bytes.fromhex(
+    "000d002c12012d002d002c12060000000000000000000000000e00360000001b000100fffce1cc3f080302000000000000000000000001"
+)  # 55B
 _LOGIN = bytes.fromhex(
     "000300010001460046000f1204002d3100000000000000000027100e00000000" + "0000000000000000000000000000000000000000000000000000000000000000" + "00000000000000000000000000000000"
 )  # 80B
@@ -106,6 +110,20 @@ class MinutePoint:
     @property
     def time(self) -> str:
         return f"{self.minute // 60:02d}:{self.minute % 60:02d}"
+
+
+@dataclass
+class RankQuote:
+    """榜单报价批的 196B 记录（字段偏移为 2026-09-14 抓包锚定）。"""
+    code: str
+    name: str
+    last_close: float
+    open: float
+    high: float
+    low: float
+    price: float
+    vol: float        # 股（记录内为 u32 手 ×100）
+    amount: float     # 元
 
 
 class TdxV2Error(Exception):
@@ -233,6 +251,31 @@ class TdxV2Client:
         self._send(_SNAPSHOT)
         return self._recv_payload()
 
+    def get_rank_page(self, list_id: int, offset: int, limit: int = 32) -> list["RankQuote"]:
+        """榜单报价分页批（2026-09-14 逆向，官方客户端多票页面同款帧）。
+
+        list_id 为服务端榜单编号（14=全市场榜，含北交所与停牌外全部票）；
+        offset 为记录偏移（步进=limit）；响应为裸批载荷：
+        [24B 前缀][u32 记录数@24][count×196B 记录@28]。同一连接可连续翻页，
+        官方客户端单连接实测 24 次轮询。
+        """
+        f = bytearray(_RANK_POLL)
+        f[25:27] = struct.pack("<H", list_id)
+        f[27:29] = struct.pack("<H", offset)
+        f[31] = limit
+        self._send(bytes(f))
+        return parse_rank_records(self._recv_payload())
+
+    def rank_quote_total(self, list_id: int = 14) -> int:
+        """榜单列表总条数（载荷前缀 u32@20）。"""
+        f = bytearray(_RANK_POLL)
+        f[25:27] = struct.pack("<H", list_id)
+        f[27:29] = struct.pack("<H", 0)
+        f[31] = 1
+        self._send(bytes(f))
+        body = self._recv_payload()
+        return struct.unpack("<I", body[20:24])[0] if len(body) >= 24 else 0
+
     @staticmethod
     def decode_gbk_name(bars_payload: bytes) -> str:
         """从日K载荷尾部 120B 提取 GBK 证券名称。"""
@@ -248,6 +291,38 @@ def decode_bars(payload: bytes, code: str) -> list[Bar]:
 def decode_quote(payload: bytes, code: str) -> dict:
     """公共入口：解析实时快照载荷（与 get_quote 同一实现）。"""
     return _decode_quote(payload, code)
+
+
+# 榜单批记录 196B：[6B 代码][16B 零][GBK 名称@22][..][昨收@66][开@70][高@74]
+# [低@78][现价@82][u32 量(手)@86][..][f32 额@94]；响应前缀 28B 含 u32 记录数@24。
+_RANK_REC_SIZE = 196
+_RANK_REC_OFF = 28
+
+
+def parse_rank_records(payload: bytes) -> list[RankQuote]:
+    """解析榜单报价批载荷（get_rank_page 的公共入口）。"""
+    if len(payload) < _RANK_REC_OFF:
+        return []
+    count = struct.unpack("<I", payload[24:28])[0]
+    count = min(count, (len(payload) - _RANK_REC_OFF) // _RANK_REC_SIZE)
+    out: list[RankQuote] = []
+    for k in range(count):
+        rec = payload[_RANK_REC_OFF + k * _RANK_REC_SIZE:
+                      _RANK_REC_OFF + (k + 1) * _RANK_REC_SIZE]
+        if len(rec) < 98:
+            break
+        code = rec[0:6].decode("ascii", "replace")
+        name = rec[22:54].split(b"\x00")[0].decode("gbk", "replace")
+        last_close, o, h, low, price = struct.unpack("<5f", rec[66:86])
+        (vol_lots,) = struct.unpack("<I", rec[86:90])
+        (amount,) = struct.unpack("<f", rec[94:98])
+        out.append(RankQuote(
+            code=code, name=name,
+            last_close=float(last_close), open=float(o), high=float(h),
+            low=float(low), price=float(price),
+            vol=float(vol_lots) * 100.0, amount=float(amount),
+        ))
+    return out
 
 
 # 分时记录 18B；记录区自载荷 offset 37 起（前 37B 为市场/代码回显 + 实时摘要，
