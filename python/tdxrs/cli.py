@@ -3,6 +3,8 @@
 用法:
     tdxrs quote 600519
     tdxrs bars 600519 --count 30
+    tdxrs v2 quote 600519            # 新一代 7709 协议（2026-07 起旧协议行情断供）
+    tdxrs v2 bars 600519 --count 30
     tdxrs download --market sh
     tdxrs --help
 """
@@ -699,6 +701,85 @@ def cmd_version(args):
 
 
 # ============================================================
+# 新一代 7709 协议（v2）
+#
+# 2026-07 起服务端对旧帧（0c 02 系）按功能族断供行情数据（快照/K线/
+# 分时/除权静默返回空，目录/财务类仍应答），官方客户端改用新帧格式。
+# 本命令组走 tdxrs.v2_client（逆向实现，详见该模块 docstring 与 research/）。
+# ============================================================
+
+_V2_DEFAULT_HOST = "121.36.248.138"
+
+
+def _add_v2_args(p):
+    p.add_argument("--host", default=_V2_DEFAULT_HOST, help=f"行情服务器 (默认{_V2_DEFAULT_HOST})")
+    p.add_argument("--port", type=int, default=7709, help="端口 (默认7709)")
+    p.add_argument("--timeout", type=float, default=6.0, help="超时秒数 (默认6)")
+    p.add_argument("--format", choices=["table", "json", "csv"], default="table")
+
+
+def cmd_v2_quote(args):
+    """实时行情（新协议）"""
+    from tdxrs.v2_client import TdxV2Client
+
+    codes = [c.strip() for c in args.code.split(",") if c.strip()]
+    if not codes:
+        print("error: 请指定至少一个股票代码", file=sys.stderr)
+        sys.exit(1)
+    check_limit("quote_codes", len(codes))
+
+    columns = [
+        ("代码", "代码", 8), ("昨收", "昨收", 10), ("开盘", "开盘", 10),
+        ("最高", "最高", 10), ("最低", "最低", 10), ("最新", "最新", 10),
+        ("涨跌%", "涨跌%", 8), ("成交量(股)", "成交量(股)", 14), ("成交额", "成交额", 14),
+    ]
+    rows = []
+    with TdxV2Client(args.host, args.port, timeout=args.timeout) as client:
+        for code in codes:
+            row = client.get_quote(auto_market(code), code)
+            change = (
+                (row["price"] - row["last_close"]) / row["last_close"] * 100
+                if row["last_close"] else 0.0
+            )
+            rows.append({
+                "代码": code,
+                "昨收": f"{row['last_close']:.2f}",
+                "开盘": f"{row['open']:.2f}",
+                "最高": f"{row['high']:.2f}",
+                "最低": f"{row['low']:.2f}",
+                "最新": f"{row['price']:.2f}",
+                "涨跌%": f"{change:+.2f}",
+                "成交量(股)": f"{row['vol']:,.0f}",
+                "成交额": f"{row['amount']:,.0f}",
+            })
+    format_output(rows, columns, args.format)
+
+
+def cmd_v2_bars(args):
+    """日K数据（新协议；其余周期字段位待验证，暂只支持日线）"""
+    from tdxrs.v2_client import TdxV2Client
+
+    count = check_limit("bars_count", args.count)
+    columns = [
+        ("日期", "日期", 12), ("开盘", "开盘", 10), ("最高", "最高", 10),
+        ("最低", "最低", 10), ("收盘", "收盘", 10), ("成交量(股)", "成交量(股)", 14),
+        ("成交额", "成交额", 16),
+    ]
+    with TdxV2Client(args.host, args.port, timeout=args.timeout) as client:
+        bars = client.get_bars(auto_market(args.code), args.code, count=count)
+    rows = [{
+        "日期": f"{bar.date}",
+        "开盘": f"{bar.open:.2f}",
+        "最高": f"{bar.high:.2f}",
+        "最低": f"{bar.low:.2f}",
+        "收盘": f"{bar.close:.2f}",
+        "成交量(股)": f"{bar.vol:,.0f}",
+        "成交额": f"{bar.amount:,.0f}",
+    } for bar in bars]
+    format_output(rows, columns, args.format)
+
+
+# ============================================================
 # 主入口
 # ============================================================
 
@@ -832,8 +913,24 @@ def main():
 
     # ── servers ──
     p = sub.add_parser("servers", help="测试服务器连通性")
-    p.add_argument("--timeout", type=float, default=3.0, help="超时秒数 (默认3)")
+    p.add_argument("--timeout", type=float, default=5.0)
     p.set_defaults(func=cmd_servers)
+
+    # ── v2（新一代 7709 协议：2026-07 起旧协议行情断供的替代通道）──
+    p = sub.add_parser("v2", help="新一代 7709 协议（实时行情/日K）")
+    v2_sub = p.add_subparsers(dest="v2_command", required=True)
+
+    q = v2_sub.add_parser("quote", help="实时行情")
+    q.add_argument("code", help="股票代码，多只用逗号分隔 (最多20)")
+    _add_v2_args(q)
+    q.set_defaults(func=cmd_v2_quote)
+
+    b = v2_sub.add_parser("bars", help="日K数据")
+    b.add_argument("code", help="股票代码")
+    b.add_argument("--count", type=int, default=CLI_LIMITS["bars_count"]["default"],
+                    help=f"条数 (默认{CLI_LIMITS['bars_count']['default']}，上限{CLI_LIMITS['bars_count']['max']})")
+    _add_v2_args(b)
+    b.set_defaults(func=cmd_v2_bars)
 
     # ── version ──
     p = sub.add_parser("version", help="版本信息")
